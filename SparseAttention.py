@@ -2,28 +2,33 @@ import torch
 import torch.nn as nn
 
 class SparseAttention(nn.Module):
-    def __init__(self, d_model, d_k, d_v, dropout=0.1, sparsity_factor=0.5):
+    def __init__(self, d_model, d_k, d_v, dropout=0.1):
         super(SparseAttention, self).__init__()
-        self.d_model = d_model
         self.d_k = d_k
-        self.d_v = d_v
+        self.w_qs = nn.Linear(d_model, d_k, bias=False)
+        self.w_ks = nn.Linear(d_model, d_k, bias=False)
+        self.w_vs = nn.Linear(d_model, d_v, bias=False)
+        self.fc = nn.Linear(d_v, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
-        self.sparsity_factor = sparsity_factor
-        self.qkv_linear = nn.Linear(d_model, d_k + d_v)
-        self.out_linear = nn.Linear(d_v, d_model)
+        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
     
-    def forward(self, x):
-        qkv = self.qkv_linear(x)
-        q, k, v = qkv.split([self.d_k, self.d_k, self.d_v], dim=-1)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+    def forward(self, q, k, v, mask=None):
+        residual = q
+        q = self.w_qs(q)
+        k = self.w_ks(k)
+        v = self.w_vs(v)
         
-        # Apply sparsity
-        topk = int(self.sparsity_factor * attn_weights.size(-1))
-        topk_weights, _ = torch.topk(attn_weights, topk, dim=-1)
-        sparse_mask = attn_weights >= topk_weights[:, :, -1:]
-        attn_weights = attn_weights * sparse_mask.float()
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        if mask is not None:
+            attn = attn.masked_fill(mask == 0, -1e9)
         
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        output = torch.matmul(attn_weights, v)
-        return self.out_linear(output)
+        sparsity_threshold = 0.9  # Example threshold, adjust as needed
+        attn[attn < sparsity_threshold] = 0
+        
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        output = torch.matmul(attn, v)
+        output = self.fc(output)
+        output += residual
+        output = self.layer_norm(output)
+        return output, attn
